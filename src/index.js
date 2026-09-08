@@ -8,7 +8,11 @@
  *
  *  1. 首条用户消息到达 → 即时出 LLM 标题（automatic: 'first-prompt'，官方节奏）
  *  2. 每轮 turn/end（completed）→ ctx.sessionTitle.refresh() 重新生成：
- *     读完整会话日志（用户消息 + 助手回答）构建转写，做一轮总结得出标题
+ *     读完整会话日志（用户消息 + 助手回答）构建转写，做一轮总结得出标题。
+ *     两道节流闸防止无谓重刷：refreshMinIntervalMs（距上次生成的最小间隔，
+ *     顺带消掉首轮 first-prompt + turn/end 的背靠背重复）与 refreshMaxTurns
+ *     （长会话冻结，回填路径不受限）；生成结果与现标题同题时静默返回现值，
+ *     不写入不告警（吸收 LLM 措辞抖动）
  *  3. 用户手动改名（source.kind === 'user'）钉住的会话绝不覆盖
  *  4. 子代理会话（header.origin === 'subagent'）与 fork 子会话跳过
  *  5. 可选启动回填：对 live 且标题仍是 fallback 的会话逐个刷新
@@ -119,6 +123,12 @@ const DEFAULTS = Object.freeze({
   includeAssistant: true,
   // 每轮 turn/end（completed）后刷新标题
   refreshOnTurnEnd: true,
+  // 同一次标题生成之后的最小刷新间隔（ms），0 = 不节流。节流同时消掉首轮
+  // 「first-prompt 首题 + turn/end 刷新」的背靠背重复生成（首次生成总是放行）
+  refreshMinIntervalMs: 120000,
+  // 会话用户消息数超过该值后冻结 turn/end 自动刷新（0 = 不限制）。
+  // 启动回填不受冻结影响——回填正是长会话存量标题的修复路径
+  refreshMaxTurns: 100,
   // 跳过 fork 子会话（父会话派生）
   excludeForks: true,
   // 跳过这些会话 id 前缀（逗号分隔）
@@ -145,6 +155,8 @@ function settingsSchema(Schema) {
     model: Schema.string().default(DEFAULTS.model),
     includeAssistant: Schema.boolean().default(DEFAULTS.includeAssistant),
     refreshOnTurnEnd: Schema.boolean().default(DEFAULTS.refreshOnTurnEnd),
+    refreshMinIntervalMs: Schema.number().step(1000).min(0).max(3600000).default(DEFAULTS.refreshMinIntervalMs),
+    refreshMaxTurns: Schema.number().step(1).min(0).max(100000).default(DEFAULTS.refreshMaxTurns),
     excludeForks: Schema.boolean().default(DEFAULTS.excludeForks),
     excludeIdPrefixes: Schema.string().default(DEFAULTS.excludeIdPrefixes),
     backfillOnStart: Schema.boolean().default(DEFAULTS.backfillOnStart),
@@ -196,6 +208,92 @@ function isExcluded(session, cfg) {
 /** 用户手动改名钉住的会话不自动刷新（显式 rename 的 source.kind === 'user'）。 */
 function isUserPinned(snapshot) {
   return Boolean(snapshot && snapshot.source && snapshot.source.kind === 'user')
+}
+
+// ── 纯函数：刷新节流 / 长会话冻结 / 同题抑制 ───────────────────────────────
+
+/** 标题归一化：去首尾、内部空白折叠、忽略大小写——同题判定用。 */
+function normalizeTitle(s) {
+  return String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+/** 同题：两边都非空且归一化相等（空标题不算同题，让首题正常落库）。 */
+function isSameTitle(a, b) {
+  const na = normalizeTitle(a)
+  return na !== '' && na === normalizeTitle(b)
+}
+
+/** 会话当前用户消息数（从日志统计；events 不可用返回 null = 未知，判定放行）。 */
+function countUserTurns(session) {
+  const events = session && session.events
+  if (!Array.isArray(events)) return null
+  let n = 0
+  for (const e of events) if (e && e.type === 'user/message') n++
+  return n
+}
+
+/** 节流：minIntervalMs<=0 或无生成记录放行；距上次生成不足窗口则拦截。 */
+function isThrottled(lastAt, now, minIntervalMs) {
+  if (!(minIntervalMs > 0)) return false
+  if (!lastAt) return false
+  return now - lastAt < minIntervalMs
+}
+
+/** 冻结：cap<=0 不限；轮数未知放行；超过 cap 冻结。 */
+function isFrozen(turns, cap) {
+  if (!(cap > 0)) return false
+  if (typeof turns !== 'number') return false
+  return turns > cap
+}
+
+// ── 纯函数：设置清洗（PUT /settings 的白名单 + 夹取）───────────────────────
+
+const NUM_RANGES = Object.freeze({
+  targetWords: [1, 20],
+  targetCjkCharacters: [1, 40],
+  maxInputBytes: [512, 200000],
+  maxOutputTokens: [16, 8192],
+  timeoutMs: [1000, 2147483647],
+  refreshMinIntervalMs: [0, 3600000],
+  refreshMaxTurns: [0, 100000],
+  backfillMaxSessions: [1, 200],
+  backfillIntervalMs: [0, 60000]
+})
+const BOOL_KEYS = Object.freeze(['enabled', 'includeAssistant', 'refreshOnTurnEnd', 'excludeForks', 'backfillOnStart'])
+const STR_KEYS = Object.freeze(['provider', 'model', 'excludeIdPrefixes'])
+
+/**
+ * 白名单清洗设置 patch：布尔只收真布尔、数字夹取进 schema 同款范围、字符串收
+ * 去尾空。路由 provider/model 必须成对（与 resolveRouteOverride 的「半配对视
+ * 为未提供」一致：只给一边时两边都丢弃，避免静默退回会话路由）。
+ */
+function sanitizePatch(body) {
+  const patch = {}
+  if (!body || typeof body !== 'object') return patch
+  for (const key of BOOL_KEYS) {
+    if (typeof body[key] === 'boolean') patch[key] = body[key]
+  }
+  for (const [key, [min, max]] of Object.entries(NUM_RANGES)) {
+    const n = Number(body[key])
+    if (Number.isFinite(n)) patch[key] = Math.min(max, Math.max(min, n))
+  }
+  for (const key of STR_KEYS) {
+    if (typeof body[key] === 'string') patch[key] = body[key].trim()
+  }
+  const hasP = typeof patch.provider === 'string' && patch.provider !== ''
+  const hasM = typeof patch.model === 'string' && patch.model !== ''
+  if (hasP !== hasM) {
+    delete patch.provider
+    delete patch.model
+  }
+  return patch
+}
+
+/** 只透出已知设置键（不漏内部状态）。 */
+function safeSettings(eff) {
+  const out = {}
+  for (const key of Object.keys(DEFAULTS)) out[key] = eff[key]
+  return out
 }
 
 // ── 纯函数：会话日志 → 转写条目 ────────────────────────────────────────────
@@ -312,6 +410,32 @@ function systemPrompt(cfg) {
   ].join('\n')
 }
 
+// ── HTTP 辅助（对齐 dsh-continue）──────────────────────────────────────────
+
+const MAX_BODY_BYTES = 64 * 1024
+
+function readJsonBody(req) {
+  return new Promise((fulfil, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) { reject(new Error('request body too large')); req.destroy(); return }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try { fulfil(chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'))) }
+      catch (error) { reject(new Error(`invalid JSON body: ${error && error.message}`)) }
+    })
+    req.on('error', reject)
+  })
+}
+
+function sendJson(res, status, payload) {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(payload))
+}
+
 // ── 插件本体 ────────────────────────────────────────────────────────────────
 
 const PLUGIN_ID = 'dsh-smart-title'
@@ -368,6 +492,10 @@ async function applyAsync(ctx, config = {}) {
 
   trace('armed', { pid: process.pid, llmAvailable: Boolean(dshLlm) })
 
+  // 每会话最近一次标题生成时刻（含官方 first-prompt 首题路径——它们都走
+  // provider.generate）。refreshSession 的节流闸据此放行/拦截。
+  const lastGenerateAt = new Map()
+
   // ── 提供方：标题生成（唯一注册位，本插件接管）──────────────────────────
   const provider = {
     id: PROVIDER_ID,
@@ -378,6 +506,7 @@ async function applyAsync(ctx, config = {}) {
       if (cfg.enabled === false) throw new Error(`${PLUGIN_ID}: disabled`)
       if (!dshLlm) throw new Error(`${PLUGIN_ID}: @deepseek-ai/dsh-llm unavailable`)
       request.signal.throwIfAborted()
+      lastGenerateAt.set(request.session.id, Date.now())
 
       const allowedSeqs = new Set(request.messages.map((m) => m.seq))
       const items = extractTranscriptItems(request.session.events, allowedSeqs, cfg.includeAssistant !== false)
@@ -445,6 +574,22 @@ async function applyAsync(ctx, config = {}) {
         .trim()
       if (!title) throw new Error(`${PLUGIN_ID}: title model produced no text`)
 
+      // 同题抑制：归一化后与现标题一致 → 静默返回现标题（服务写入同值，侧栏
+      // 零变化、无失败告警）。LLM 非确定性导致的措辞/大小写抖动在这里被吸收。
+      let currentTitle = ''
+      try {
+        const snap = ctx.sessionTitle.get(request.session)
+        currentTitle = snap && typeof snap.title === 'string' ? snap.title : ''
+      } catch {}
+      if (isSameTitle(currentTitle, title)) {
+        trace('same-title-skip', { sessionId: request.session.id })
+        return {
+          title: currentTitle,
+          messageSeqs: trimmed.filter((it) => it.role === 'user').map((it) => it.seq),
+          model: route
+        }
+      }
+
       return {
         title,
         messageSeqs: trimmed.filter((it) => it.role === 'user').map((it) => it.seq),
@@ -470,6 +615,18 @@ async function applyAsync(ctx, config = {}) {
     }
     if (isUserPinned(snap)) return
     const sid = session.id
+    // 长会话冻结：用户消息数超过 refreshMaxTurns 后不再自动刷新（回填不受限，
+    // 它正是存量长会话的修复路径）；轮数未知（events 缺席）放行。
+    if (why !== 'backfill' && isFrozen(countUserTurns(session), cfg.refreshMaxTurns)) {
+      trace('frozen', { sessionId: sid, turns: countUserTurns(session), cap: cfg.refreshMaxTurns })
+      return
+    }
+    // 节流：距上次标题生成（含官方 first-prompt 首题）不足 refreshMinIntervalMs
+    // 则跳过——消掉每轮必刷与首轮 first-prompt + turn/end 的背靠背重复。
+    if (isThrottled(lastGenerateAt.get(sid), Date.now(), cfg.refreshMinIntervalMs)) {
+      trace('throttled', { sessionId: sid, why, sinceMs: Date.now() - (lastGenerateAt.get(sid) || 0) })
+      return
+    }
     if (inflightRefresh.has(sid)) return
     inflightRefresh.add(sid)
     Promise.resolve()
@@ -506,6 +663,66 @@ async function applyAsync(ctx, config = {}) {
       } catch {}
     }
   }, `${PLUGIN_ID}: session/event subscription`)
+
+  // ── HTTP API：设置页数据面（status 读 / settings 写 / models 目录）──────
+  if (ctx.webServer && typeof ctx.webServer.register === 'function') {
+    ctx.effect(() => ctx.webServer.register({
+      kind: 'prefix',
+      path: `/${PLUGIN_ID}/api`,
+      handler: async (req, res) => {
+        try {
+          const url = new URL(req.url || '/', 'http://dsh.local')
+          const apiPath = url.pathname.replace(/\/+$/, '')
+
+          // GET /dsh-smart-title/api/status
+          if (req.method === 'GET' && apiPath.endsWith(`/${PLUGIN_ID}/api/status`)) {
+            sendJson(res, 200, {
+              armed: Boolean(dshLlm),
+              settings: safeSettings(effective())
+            })
+            return
+          }
+
+          // GET /dsh-smart-title/api/models — 设置页路由下拉的模型目录
+          //（llm.listProviders + 逐 provider listModels；缺席时降级空目录）
+          if (req.method === 'GET' && apiPath.endsWith(`/${PLUGIN_ID}/api/models`)) {
+            const out = { default: null, providers: [] }
+            try {
+              if (ctx.agentDefaultModel && typeof ctx.agentDefaultModel.currentSelection === 'function')
+                out.default = ctx.agentDefaultModel.currentSelection()
+            } catch {}
+            try {
+              const providers = ctx.llm && typeof ctx.llm.listProviders === 'function' ? ctx.llm.listProviders() : []
+              for (const p of providers || []) {
+                let models = []
+                try { models = (await ctx.llm.listModels(p.id)) || [] } catch {}
+                out.providers.push({
+                  id: p.id, name: p.name || p.id,
+                  models: models.map((m) => ({ id: m.id, name: m.name || m.id }))
+                })
+              }
+            } catch {}
+            sendJson(res, 200, out)
+            return
+          }
+
+          // PUT /dsh-smart-title/api/settings — 白名单清洗后落 settings 服务
+          //（settings 服务缺席时退回内存覆盖，仅本次进程有效）
+          if (req.method === 'PUT' && apiPath.endsWith(`/${PLUGIN_ID}/api/settings`)) {
+            const body = await readJsonBody(req)
+            const patch = sanitizePatch(body)
+            if (settingsScope && typeof settingsScope.update === 'function') await settingsScope.update(patch)
+            else Object.assign(config, patch)
+            trace('settings-updated', { keys: Object.keys(patch) })
+            sendJson(res, 200, { settings: safeSettings(effective()) })
+            return
+          }
+
+          sendJson(res, 404, { error: 'not found' })
+        } catch (error) { sendJson(res, 400, { error: String((error && error.message) || error) }) }
+      }
+    }), `${PLUGIN_ID}: api route`)
+  }
 
   // ── 启动回填（默认关）：live 且最新标题来源是 fallback 的会话逐个刷新 ──
   if (effective().backfillOnStart === true && ctx.sessions && typeof ctx.sessions.list === 'function') {
@@ -544,11 +761,18 @@ async function applyAsync(ctx, config = {}) {
 
 module.exports = {
   name: PLUGIN_ID,
-  inject: ['sessionTitle', 'llm', 'sessions', 'settings'],
+  inject: ['sessionTitle', 'llm', 'sessions', 'settings', 'webServer', 'agentDefaultModel'],
   __internals: {
     reasonKind,
     isExcluded,
     isUserPinned,
+    normalizeTitle,
+    isSameTitle,
+    countUserTurns,
+    isThrottled,
+    isFrozen,
+    sanitizePatch,
+    safeSettings,
     parseIdPrefixes,
     messageText,
     extractTranscriptItems,
