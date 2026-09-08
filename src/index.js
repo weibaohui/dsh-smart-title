@@ -543,7 +543,9 @@ async function applyAsync(ctx, config = {}) {
 
       const system = systemPrompt(cfg)
       const deadlineAt = Date.now() + cfg.timeoutMs
-      const options = dshLlm.deepFreeze({
+      // 对齐官方 dsh-session-title-llm 的 options 形状；freeze 仅浅防误改
+      //（官方的 deepFreeze 在 @deepseek-ai/dsh-util-values，dsh-llm 没有此导出）
+      const options = Object.freeze({
         provider: route.provider,
         model: route.model,
         messages: [
