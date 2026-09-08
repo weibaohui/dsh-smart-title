@@ -8,6 +8,14 @@ const {
   reasonKind,
   isExcluded,
   isUserPinned,
+  normalizeTitle,
+  sessionEventsOf,
+  isSameTitle,
+  countUserTurns,
+  isThrottled,
+  isFrozen,
+  sanitizePatch,
+  safeSettings,
   parseIdPrefixes,
   messageText,
   extractTranscriptItems,
@@ -203,7 +211,7 @@ test('resolveRouteOverride: 成对生效、半配对视为未提供、空缺为 
 
 // ── 端到端（mock ctx）：turn/end → refresh，钉住/排除路径不 refresh ────────
 
-function makeMockCtx({ titleSource = 'fallback', session }) {
+function makeMockCtx({ titleSource = 'fallback', titleText = '旧标题', session }) {
   const effects = []
   const registered = []
   let eventHandler = null
@@ -212,7 +220,9 @@ function makeMockCtx({ titleSource = 'fallback', session }) {
     logger: { info() {}, warn() {} },
     settings: {
       register(ns, schema, opts) {
-        return { get: () => ({ ...opts.base }) }
+        // 模拟真实 settings 服务：base 可被 update（深合并在宿主侧，平键直接覆盖）
+        const base = { ...opts.base }
+        return { get: () => ({ ...base }), update: async (patch) => { Object.assign(base, patch) } }
       }
     },
     sessionTitle: {
@@ -221,7 +231,7 @@ function makeMockCtx({ titleSource = 'fallback', session }) {
         return () => {}
       },
       get() {
-        return titleSource === 'none' ? undefined : { source: { kind: titleSource }, title: '旧标题' }
+        return titleSource === 'none' ? undefined : { source: { kind: titleSource }, title: titleText }
       },
       refresh(session) {
         refreshCalls.push(session.id)
@@ -363,4 +373,305 @@ test('apply: generate() 走通 happy path（seed 假 dsh-llm + mock llm.stream�
   assert.equal(result.title, '会话标题插件')
   assert.deepEqual(result.messageSeqs, [7])
   assert.deepEqual(result.model, { provider: 'zhanlu', model: 'zhanlu/glm-5.2' })
+})
+
+// ── 刷新节流 / 长会话冻结 / 同题抑制（纯函数）────────────────────────────
+
+test('normalizeTitle: 空值→空串、空白折叠、大小写归一', async () => {
+  assert.equal(normalizeTitle(null), '')
+  assert.equal(normalizeTitle(undefined), '')
+  assert.equal(normalizeTitle('  '), '')
+  assert.equal(normalizeTitle('  Fix   DSH Deps '), 'fix dsh deps')
+})
+
+test('isSameTitle: 空标题永不同题（首题正常落库），大小写/空白差异算同题', async () => {
+  assert.equal(isSameTitle('', 'x'), false)
+  assert.equal(isSameTitle('  ', 'x'), false)
+  assert.equal(isSameTitle('修复 DSH 依赖', '修复 dsh  依赖'), true)
+  assert.equal(isSameTitle('修复依赖', '修复 依赖 bug'), false)
+})
+
+test('countUserTurns: 只数 user/message；优先 snapshotEvents()，events 兜底，全缺席 → null', async () => {
+  const events = [
+    { type: 'user/message', seq: 1, data: {} },
+    { type: 'assistant/message', seq: 2, data: {} },
+    { type: 'user/message', seq: 3, data: {} },
+    { type: 'turn/end', data: {} }
+  ]
+  assert.equal(countUserTurns({ id: 's', events }), 2)
+  assert.equal(countUserTurns({ id: 's', snapshotEvents: () => events }), 2)
+  // spill 场景：events 属性非数组，snapshotEvents() 才是真日志
+  assert.equal(countUserTurns({ id: 's', events: 'spilled', snapshotEvents: () => events }), 2)
+  assert.equal(countUserTurns({ id: 's', events: 'spilled' }), null)
+  assert.equal(countUserTurns({ id: 's' }), null)
+  assert.equal(countUserTurns(null), null)
+})
+
+test('sessionEventsOf: snapshotEvents() 优先、异常吞掉、无访问器回退 events 属性', async () => {
+  const evs = [{ type: 'user/message', seq: 1 }]
+  assert.equal(sessionEventsOf({ snapshotEvents: () => evs, events: 'spilled' }), evs)
+  assert.equal(sessionEventsOf({ events: evs }), evs)
+  assert.deepEqual(sessionEventsOf({ snapshotEvents: () => { throw new Error('boom') } }), [])
+  assert.deepEqual(sessionEventsOf({ events: 'spilled' }), [])
+  assert.deepEqual(sessionEventsOf(null), [])
+})
+
+test('isThrottled: 0=不节流、无记录放行、窗口内拦截、过期放行', async () => {
+  assert.equal(isThrottled(undefined, 10000, 5000), false)
+  assert.equal(isThrottled(9000, 10000, 5000), true)
+  assert.equal(isThrottled(4999, 10000, 5000), false)
+  assert.equal(isThrottled(0, 10000, 0), false)
+})
+
+test('isFrozen: 0=不限、未知轮数放行、超过 cap 冻结、等于 cap 不冻', async () => {
+  assert.equal(isFrozen(5, 0), false)
+  assert.equal(isFrozen(null, 100), false)
+  assert.equal(isFrozen(3, 2), true)
+  assert.equal(isFrozen(2, 2), false)
+})
+
+// ── sanitizePatch / safeSettings ────────────────────────────────────────
+
+test('sanitizePatch: 布尔白名单、数字夹取、字符串去尾空、未知键丢弃', async () => {
+  const patch = sanitizePatch({
+    enabled: false,
+    includeAssistant: 'yes', // 非布尔 → 丢弃
+    refreshOnTurnEnd: true,
+    targetWords: 999, // 夹到 20
+    maxInputBytes: 10, // 夹到 512
+    refreshMinIntervalMs: -5, // 夹到 0
+    refreshMaxTurns: '50', // 数字串 → 50
+    excludeIdPrefixes: ' a , b ',
+    provider: 'p1',
+    bogus: 'x'
+  })
+  assert.equal(patch.enabled, false)
+  assert.equal(patch.includeAssistant, undefined)
+  assert.equal(patch.refreshOnTurnEnd, true)
+  assert.equal(patch.targetWords, 20)
+  assert.equal(patch.maxInputBytes, 512)
+  assert.equal(patch.refreshMinIntervalMs, 0)
+  assert.equal(patch.refreshMaxTurns, 50)
+  assert.equal(patch.excludeIdPrefixes, 'a , b')
+  assert.equal(patch.bogus, undefined)
+})
+
+test('sanitizePatch: 路由半配对两边都丢弃，成对保留；非对象输入 → 空 patch', async () => {
+  assert.equal(sanitizePatch({ provider: 'p1', model: '' }).provider, undefined)
+  assert.equal(sanitizePatch({ provider: '', model: 'm1' }).model, undefined)
+  assert.deepEqual(sanitizePatch({ provider: ' p1 ', model: ' m1 ' }), { provider: 'p1', model: 'm1' })
+  assert.deepEqual(sanitizePatch(null), {})
+  assert.deepEqual(sanitizePatch('x'), {})
+})
+
+test('safeSettings: 只透出 DEFAULTS 键集合', async () => {
+  const out = safeSettings({ ...DEFAULTS, extra: 'x' })
+  assert.deepEqual(Object.keys(out).sort(), Object.keys(DEFAULTS).sort())
+  assert.equal(out.extra, undefined)
+})
+
+// ── apply 级：同题静默 / 节流 / 冻结 / 回填豁免 / HTTP API ────────────────
+
+const genChunks = (text) => [
+  { type: 'block-start', index: 0, blockType: 'text' },
+  { type: 'text-delta', index: 0, text },
+  { type: 'block-end', index: 0, block: { type: 'text', text } },
+  { type: 'finish', reason: { kind: 'stop' } }
+]
+
+function seedFakeLlm() {
+  class FakeBlockAssembler {
+    constructor() { this.parts = []; this.finish = undefined }
+    push(chunk) {
+      if (chunk.type === 'text-delta') {
+        if (typeof this.parts[this.parts.length - 1] !== 'string') this.parts.push('')
+        this.parts[this.parts.length - 1] += chunk.text
+      } else if (chunk.type === 'finish') this.finish = chunk.reason
+    }
+    blocks() { return this.parts.filter((p) => p.length > 0).map((p) => ({ type: 'text', text: p })) }
+  }
+  require('../src/index.js').__internals.__seedDshLlm({
+    BlockAssembler: FakeBlockAssembler,
+    createUserMessage: (input) => ({ role: 'user', content: input.content, source: input.source }),
+    deepFreeze: (value) => value
+  })
+}
+
+const genSession = (id = 's-gen') => ({
+  id,
+  header: {},
+  events: [
+    { type: 'user/message', seq: 7, data: { content: [{ type: 'text', text: '帮我写个插件' }] } },
+    { type: 'assistant/message', seq: 8, data: { message: { content: [{ type: 'text', text: '好的，正在写' }] } } }
+  ]
+})
+
+async function runGenerate(ctx, registered, session, text) {
+  ctx.llm = { stream: async function* () { for (const c of genChunks(text)) yield c } }
+  return registered[0].generate({
+    session,
+    messages: [{ seq: 7, text: '帮我写个插件' }],
+    route: { provider: 'zhanlu', model: 'zhanlu/glm-5.2' },
+    signal: { throwIfAborted() {} }
+  })
+}
+
+test('apply: generate 同题静默——返回现标题原文，不抛错', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+  const session = genSession('s-same')
+  // 现标题带尾随空格；生成结果归一化后与之相同 → 返回现标题原文
+  const { ctx, registered } = makeMockCtx({ session, titleText: '会话标题插件 ' })
+  await apply(ctx, {})
+  const result = await runGenerate(ctx, registered, session, '会话标题插件')
+  assert.equal(result.title, '会话标题插件 ')
+  assert.deepEqual(result.messageSeqs, [7])
+})
+
+test('apply: generate 不同题 → 返回新生成标题', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+  const session = genSession('s-diff')
+  const { ctx, registered } = makeMockCtx({ session, titleText: '完全不同的旧标题' })
+  await apply(ctx, {})
+  const result = await runGenerate(ctx, registered, session, '会话标题插件')
+  assert.equal(result.title, '会话标题插件')
+})
+
+test('apply: 节流——generate 后窗口内的 turn/end 不再 refresh；窗口过期放行', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+
+  // 窗口 60s：generate 之后立刻来的 turn/end 被节流
+  const session = genSession('s-throttle')
+  const a = makeMockCtx({ session })
+  await apply(a.ctx, { refreshMinIntervalMs: 60000 })
+  await runGenerate(a.ctx, a.registered, session, '第一个标题')
+  a.getHandler()(session, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+  await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(a.refreshCalls, [])
+
+  // 窗口 20ms：过期后 turn/end 正常 refresh
+  const session2 = genSession('s-throttle2')
+  const b = makeMockCtx({ session: session2 })
+  await apply(b.ctx, { refreshMinIntervalMs: 20 })
+  await runGenerate(b.ctx, b.registered, session2, '第二个标题')
+  await new Promise((r) => setTimeout(r, 60))
+  b.getHandler()(session2, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+  await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(b.refreshCalls, ['s-throttle2'])
+})
+
+test('apply: 长会话冻结——用户消息超过 refreshMaxTurns 的 turn/end 不 refresh', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+  const session = {
+    id: 's-long',
+    header: {},
+    events: [
+      { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '一' }] } },
+      { type: 'user/message', seq: 2, data: { content: [{ type: 'text', text: '二' }] } },
+      { type: 'user/message', seq: 3, data: { content: [{ type: 'text', text: '三' }] } }
+    ]
+  }
+  const { ctx, refreshCalls, getHandler } = makeMockCtx({ session })
+  await apply(ctx, { refreshMaxTurns: 2, refreshMinIntervalMs: 0 })
+  getHandler()(session, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+  await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(refreshCalls, [])
+
+  // cap=0（不限制）→ 正常 refresh
+  const { ctx: ctx2, refreshCalls: rc2, getHandler: gh2 } = makeMockCtx({ session })
+  await apply(ctx2, { refreshMaxTurns: 0, refreshMinIntervalMs: 0 })
+  gh2()(session, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+  await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(rc2, ['s-long'])
+})
+
+test('apply: 启动回填豁免冻结——超长 fallback 会话仍被回填', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+  const session = {
+    id: 's-backfill',
+    header: {},
+    events: [
+      { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '一' }] } },
+      { type: 'user/message', seq: 2, data: { content: [{ type: 'text', text: '二' }] } },
+      { type: 'user/message', seq: 3, data: { content: [{ type: 'text', text: '三' }] } }
+    ]
+  }
+  const { ctx, refreshCalls } = makeMockCtx({ session })
+  await apply(ctx, { refreshMaxTurns: 2, backfillOnStart: true, backfillMaxSessions: 5, backfillIntervalMs: 5 })
+  await new Promise((r) => setTimeout(r, 80))
+  assert.deepEqual(refreshCalls, ['s-backfill'])
+})
+
+// ── HTTP API：status 读 / settings 白名单写入 ────────────────────────────
+
+function makeRes() {
+  return {
+    code: null, headers: null, body: null,
+    writeHead(code, headers) { this.code = code; this.headers = headers },
+    end(body) { this.body = body }
+  }
+}
+
+function makeReq(method, url, bodyObj) {
+  const chunk = bodyObj === undefined ? null : Buffer.from(JSON.stringify(bodyObj))
+  return {
+    method,
+    url,
+    on(ev, cb) {
+      if (ev === 'data' && chunk) cb(chunk)
+      else if (ev === 'end') setImmediate(cb)
+    }
+  }
+}
+
+test('apply: webServer 缺席时跳过 API 注册（无注入也不炸）', async () => {
+  const apply = loadApply()
+  const session = { id: 's-noapi', header: {} }
+  const { ctx, getHandler } = makeMockCtx({ session })
+  await apply(ctx, {})
+  assert.equal(typeof getHandler(), 'function')
+})
+
+test('apply: GET /status 返回 armed 与设置全集；PUT /settings 白名单清洗落库', async () => {
+  const apply = loadApply()
+  const session = { id: 's-api', header: {} }
+  const { ctx, registered } = makeMockCtx({ session })
+  const apiRegisters = []
+  ctx.webServer = { register(h) { apiRegisters.push(h); return () => {} } }
+  await apply(ctx, {})
+  assert.equal(apiRegisters.length, 1)
+  const handler = apiRegisters[0].handler
+
+  // GET /status
+  const res1 = makeRes()
+  await handler(makeReq('GET', '/dsh-smart-title/api/status'), res1)
+  const d1 = JSON.parse(res1.body)
+  assert.equal(res1.code, 200)
+  assert.equal(d1.armed, true)
+  assert.equal(d1.settings.refreshMinIntervalMs, DEFAULTS.refreshMinIntervalMs)
+  assert.equal(d1.settings.refreshMaxTurns, DEFAULTS.refreshMaxTurns)
+
+  // PUT /settings：夹取 + 半配对丢弃 + 未知键丢弃（走 settingsScope.update 主路径）
+  const res2 = makeRes()
+  await handler(makeReq('PUT', '/dsh-smart-title/api/settings', {
+    refreshMinIntervalMs: 999999999,
+    targetWords: 7,
+    provider: 'p1',
+    model: '',
+    bogus: 1
+  }), res2)
+  const d2 = JSON.parse(res2.body)
+  assert.equal(res2.code, 200)
+  assert.equal(d2.settings.refreshMinIntervalMs, 3600000)
+  assert.equal(d2.settings.targetWords, 7)
+  assert.equal(d2.settings.provider, '')
+
+  // 未知路径 → 404
+  const res3 = makeRes()
+  await handler(makeReq('GET', '/dsh-smart-title/api/nope'), res3)
+  assert.equal(res3.code, 404)
 })
