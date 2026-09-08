@@ -1,0 +1,49 @@
+{
+  "name": "@weibaohui/dsh-smart-title",
+  "version": "0.1.0",
+  "description": "dsh 插件 · 会话智能标题：用 LLM 自动改写会话标题。每轮对话结束后对「用户消息 + 助手回答」的完整转写做一轮总结，标题跟随会话真实主题；首条消息即时出题、LLM 请求失败自动重试、用户手动改名不被覆盖、可选启动回填修复存量 fallback 标题。",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "session-title",
+    "title",
+    "llm"
+  ],
+  "main": "src/index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/index.js",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/weibaohui/dsh-smart-title.git"
+  },
+  "homepage": "https://github.com/weibaohui/dsh-smart-title#readme",
+  "bugs": {
+    "url": "https://github.com/weibaohui/dsh-smart-title/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

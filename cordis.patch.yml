@@ -1,0 +1,20 @@
+# dsh-plugin-dsh-smart-title bundle patch：插件经 `dsh plugin add` 安装时，
+# 由本 patch 把插件行注入宿主组合，并接管内建的 first-prompt 标题提供方。
+#
+# 本插件是 HOST-PLANE：注册 ctx.sessionTitle 的标题提供方（注册表只允许一个，
+# 见 @deepseek-ai/dsh-session-title README），并订阅 session/event 的 turn/end
+# 做全对话总结刷新。它必须落在宿主组合里（insert），绝不进 agent preset。
+#
+# 关键：base 组合默认挂了 dsh-session-title-first-prompt-llm（行 id
+# session-title-llm）。sessionTitle 服务只允许注册一个提供方，第二个 register
+# 会立即抛错导致插件加载失败（plugin tree failed to load）。因此必须先禁用
+# 内建行（同 id 覆盖，last write wins），卸载本插件时本层随之移除、内建自动恢复。
+
+- insert:
+    - id: dsh-smart-title
+      name: '@weibaohui/dsh-smart-title'
+
+# 内建 first-prompt-llm 提供方让位：同 id 覆盖禁用（对齐 dsh-continue 复用
+# compaction-basic 行的同款机制）。
+- id: session-title-llm
+  disabled: true
