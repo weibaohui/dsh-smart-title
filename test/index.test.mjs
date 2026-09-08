@@ -9,6 +9,7 @@ const {
   isExcluded,
   isUserPinned,
   normalizeTitle,
+  sessionEventsOf,
   isSameTitle,
   countUserTurns,
   isThrottled,
@@ -390,7 +391,7 @@ test('isSameTitle: 空标题永不同题（首题正常落库），大小写/空
   assert.equal(isSameTitle('修复依赖', '修复 依赖 bug'), false)
 })
 
-test('countUserTurns: 只数 user/message；events 缺席/会话为空 → null', async () => {
+test('countUserTurns: 只数 user/message；优先 snapshotEvents()，events 兜底，全缺席 → null', async () => {
   const events = [
     { type: 'user/message', seq: 1, data: {} },
     { type: 'assistant/message', seq: 2, data: {} },
@@ -398,9 +399,21 @@ test('countUserTurns: 只数 user/message；events 缺席/会话为空 → null'
     { type: 'turn/end', data: {} }
   ]
   assert.equal(countUserTurns({ id: 's', events }), 2)
+  assert.equal(countUserTurns({ id: 's', snapshotEvents: () => events }), 2)
+  // spill 场景：events 属性非数组，snapshotEvents() 才是真日志
+  assert.equal(countUserTurns({ id: 's', events: 'spilled', snapshotEvents: () => events }), 2)
+  assert.equal(countUserTurns({ id: 's', events: 'spilled' }), null)
   assert.equal(countUserTurns({ id: 's' }), null)
-  assert.equal(countUserTurns({ id: 's', events: 'not-array' }), null)
   assert.equal(countUserTurns(null), null)
+})
+
+test('sessionEventsOf: snapshotEvents() 优先、异常吞掉、无访问器回退 events 属性', async () => {
+  const evs = [{ type: 'user/message', seq: 1 }]
+  assert.equal(sessionEventsOf({ snapshotEvents: () => evs, events: 'spilled' }), evs)
+  assert.equal(sessionEventsOf({ events: evs }), evs)
+  assert.deepEqual(sessionEventsOf({ snapshotEvents: () => { throw new Error('boom') } }), [])
+  assert.deepEqual(sessionEventsOf({ events: 'spilled' }), [])
+  assert.deepEqual(sessionEventsOf(null), [])
 })
 
 test('isThrottled: 0=不节流、无记录放行、窗口内拦截、过期放行', async () => {

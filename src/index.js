@@ -223,10 +223,10 @@ function isSameTitle(a, b) {
   return na !== '' && na === normalizeTitle(b)
 }
 
-/** 会话当前用户消息数（从日志统计；events 不可用返回 null = 未知，判定放行）。 */
+/** 会话当前用户消息数（从事件日志统计；日志不可得返回 null = 未知，判定放行）。 */
 function countUserTurns(session) {
-  const events = session && session.events
-  if (!Array.isArray(events)) return null
+  const events = sessionEventsOf(session)
+  if (events.length === 0 && !(session && (typeof session.snapshotEvents === 'function' || Array.isArray(session.events)))) return null
   let n = 0
   for (const e of events) if (e && e.type === 'user/message') n++
   return n
@@ -297,6 +297,20 @@ function safeSettings(eff) {
 }
 
 // ── 纯函数：会话日志 → 转写条目 ────────────────────────────────────────────
+
+/**
+ * 会话事件日志的防御性取用。宿主会话的正规入口是 snapshotEvents()（live/
+ * persisted 通吃）；裸读 `session.events` 在事件 spill 到盘后不是数组
+ * （hermes-loop 真机同款坑），取不到转写还静默失败。
+ */
+function sessionEventsOf(session) {
+  if (!session) return []
+  try {
+    const evs = typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : session.events
+    if (Array.isArray(evs)) return evs
+  } catch {}
+  return []
+}
 
 /** 从一条 message 的 content 块里抽取纯文本（只取 text 块，空白折叠）。 */
 function messageText(content) {
@@ -509,9 +523,10 @@ async function applyAsync(ctx, config = {}) {
       lastGenerateAt.set(request.session.id, Date.now())
 
       const allowedSeqs = new Set(request.messages.map((m) => m.seq))
-      const items = extractTranscriptItems(request.session.events, allowedSeqs, cfg.includeAssistant !== false)
+      const items = extractTranscriptItems(sessionEventsOf(request.session), allowedSeqs, cfg.includeAssistant !== false)
       if (items.length === 0) {
         // 快照里没有任何可用文本（纯附件消息等）：交给服务维持原状
+        trace('no-items', { sessionId: request.session.id, allowed: allowedSeqs.size })
         throw new Error(`${PLUGIN_ID}: no eligible transcript items in snapshot`)
       }
       const trimmed = trimTranscript(items, cfg.maxInputBytes)
@@ -769,6 +784,7 @@ module.exports = {
     normalizeTitle,
     isSameTitle,
     countUserTurns,
+    sessionEventsOf,
     isThrottled,
     isFrozen,
     sanitizePatch,
