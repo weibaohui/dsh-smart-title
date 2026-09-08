@@ -91,6 +91,14 @@ async function resolveDshLlm() {
   return mod && typeof mod.BlockAssembler === 'function' && typeof mod.createUserMessage === 'function' ? mod : null
 }
 
+// 测试缝隙：预先注入已解析的模块，让单测不依赖本机宿主安装（CI 上无 ~/.local 宿主目录）
+function __seedDshLlm(mod) {
+  dshLlmPromise = Promise.resolve(mod)
+}
+function __seedSchema(Schema) {
+  schemaPromise = Promise.resolve(Schema ? { default: Schema } : null)
+}
+
 // ── 默认配置（DEFAULTS 与 settingsSchema 共用同一份，防止漂移）─────────────
 
 const DEFAULTS = Object.freeze({
@@ -550,6 +558,8 @@ module.exports = {
     systemPrompt,
     resolveRouteOverride,
     settingsSchema,
+    __seedDshLlm,
+    __seedSchema,
     DEFAULTS,
     SETTINGS_NS
   },

@@ -303,8 +303,36 @@ test('apply: 无标题会话（snapshot undefined）也触发 refresh（fallback
   assert.deepEqual(refreshCalls, ['s-fresh'])
 })
 
-test('apply: generate() 走通 happy path（mock llm.stream）', async () => {
+test('apply: generate() 走通 happy path（seed 假 dsh-llm + mock llm.stream，不依赖宿主安装）', async () => {
   const apply = loadApply()
+  const internals = require('../src/index.js').__internals
+
+  // 假 BlockAssembler：实现与真实契约对齐的 push/blocks/finish（覆盖我们消费的形状）
+  class FakeBlockAssembler {
+    constructor() {
+      this.parts = []
+      this.finish = undefined
+    }
+    push(chunk) {
+      if (chunk.type === 'text-delta') {
+        if (typeof this.parts[this.parts.length - 1] !== 'string') this.parts.push('')
+        this.parts[this.parts.length - 1] += chunk.text
+      } else if (chunk.type === 'finish') {
+        this.finish = chunk.reason
+      }
+    }
+    blocks() {
+      return this.parts.filter((p) => p.length > 0).map((p) => ({ type: 'text', text: p }))
+    }
+  }
+  const fakeDshLlm = {
+    BlockAssembler: FakeBlockAssembler,
+    createUserMessage: (input) => ({ role: 'user', content: input.content, source: input.source }),
+    deepFreeze: (value) => value
+  }
+  // 注入前先重置（模块级 promise 只 seed 一次；多次 seed 无害，apply 只读一次）
+  internals.__seedDshLlm(fakeDshLlm)
+
   const session = {
     id: 's-gen',
     header: {},
