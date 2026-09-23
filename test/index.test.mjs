@@ -218,6 +218,7 @@ function makeMockCtx({ titleSource = 'fallback', titleText = '旧标题', sessio
   const refreshCalls = []
   const ctx = {
     logger: { info() {}, warn() {} },
+    connection: { requestRejection: () => undefined },
     settings: {
       register(ns, schema, opts) {
         // 模拟真实 settings 服务：base 可被 update（深合并在宿主侧，平键直接覆盖）
