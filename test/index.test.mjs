@@ -211,14 +211,14 @@ test('resolveRouteOverride: 成对生效、半配对视为未提供、空缺为 
 
 // ── 端到端（mock ctx）：turn/end → refresh，钉住/排除路径不 refresh ────────
 
-function makeMockCtx({ titleSource = 'fallback', titleText = '旧标题', session }) {
+function makeMockCtx({ titleSource = 'fallback', titleText = '旧标题', session, rejection } = {}) {
   const effects = []
   const registered = []
   let eventHandler = null
   const refreshCalls = []
   const ctx = {
     logger: { info() {}, warn() {} },
-    connection: { requestRejection: () => undefined },
+    connection: { requestRejection: () => rejection },
     settings: {
       register(ns, schema, opts) {
         // 模拟真实 settings 服务：base 可被 update（深合并在宿主侧，平键直接覆盖）
@@ -675,4 +675,18 @@ test('apply: GET /status 返回 armed 与设置全集；PUT /settings 白名单�
   const res3 = makeRes()
   await handler(makeReq('GET', '/dsh-smart-title/api/nope'), res3)
   assert.equal(res3.code, 404)
+})
+
+test('every route sits behind the connection trust fence', async () => {
+  const apply = loadApply()
+  const session = { id: 's-fence', header: {} }
+  const { ctx } = makeMockCtx({ session, rejection: 401 })
+  const apiRegisters = []
+  ctx.webServer = { register(h) { apiRegisters.push(h); return () => {} } }
+  await apply(ctx, {})
+  assert.equal(apiRegisters.length, 1)
+  const handler = apiRegisters[0].handler
+  const res = { statusCode: null, code: null, body: null, writeHead(c) { this.statusCode = c; this.code = c }, end(b) { this.body = b } }
+  await handler({ method: 'GET', url: '/dsh-smart-title/api/status', headers: {} }, res)
+  assert.equal(res.statusCode, 401, 'unauthenticated status read is refused')
 })
