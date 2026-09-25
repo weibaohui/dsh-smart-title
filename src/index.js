@@ -142,28 +142,46 @@ const DEFAULTS = Object.freeze({
 
 const SETTINGS_NS = 'dsh-smart-title'
 
+// 0.1.7 settings 服务：字段标 .volatile() 才能被设置 UI 投影、才能经
+// ctx.settings.update 在线写回（对齐 dsh-settings-ui / hermes-loop）。
 function settingsSchema(Schema) {
   if (!Schema || typeof Schema.object !== 'function') return null
   return Schema.object({
-    enabled: Schema.boolean().default(DEFAULTS.enabled),
-    targetWords: Schema.number().step(1).min(1).max(20).default(DEFAULTS.targetWords),
-    targetCjkCharacters: Schema.number().step(1).min(1).max(40).default(DEFAULTS.targetCjkCharacters),
-    maxInputBytes: Schema.number().step(1).min(512).max(200000).default(DEFAULTS.maxInputBytes),
-    maxOutputTokens: Schema.number().step(1).min(16).max(8192).default(DEFAULTS.maxOutputTokens),
-    timeoutMs: Schema.number().step(1).min(1000).max(2147483647).default(DEFAULTS.timeoutMs),
-    provider: Schema.string().default(DEFAULTS.provider),
-    model: Schema.string().default(DEFAULTS.model),
-    includeAssistant: Schema.boolean().default(DEFAULTS.includeAssistant),
-    refreshOnTurnEnd: Schema.boolean().default(DEFAULTS.refreshOnTurnEnd),
-    refreshMinIntervalMs: Schema.number().step(1000).min(0).max(3600000).default(DEFAULTS.refreshMinIntervalMs),
-    refreshMaxTurns: Schema.number().step(1).min(0).max(100000).default(DEFAULTS.refreshMaxTurns),
-    excludeForks: Schema.boolean().default(DEFAULTS.excludeForks),
-    excludeIdPrefixes: Schema.string().default(DEFAULTS.excludeIdPrefixes),
-    backfillOnStart: Schema.boolean().default(DEFAULTS.backfillOnStart),
-    backfillMaxSessions: Schema.number().step(1).min(1).max(200).default(DEFAULTS.backfillMaxSessions),
-    backfillIntervalMs: Schema.number().step(1).min(0).max(60000).default(DEFAULTS.backfillIntervalMs)
+    enabled: Schema.boolean().default(DEFAULTS.enabled).volatile(),
+    targetWords: Schema.number().step(1).min(1).max(20).default(DEFAULTS.targetWords).volatile(),
+    targetCjkCharacters: Schema.number().step(1).min(1).max(40).default(DEFAULTS.targetCjkCharacters).volatile(),
+    maxInputBytes: Schema.number().step(1).min(512).max(200000).default(DEFAULTS.maxInputBytes).volatile(),
+    maxOutputTokens: Schema.number().step(1).min(16).max(8192).default(DEFAULTS.maxOutputTokens).volatile(),
+    timeoutMs: Schema.number().step(1).min(1000).max(2147483647).default(DEFAULTS.timeoutMs).volatile(),
+    provider: Schema.string().default(DEFAULTS.provider).volatile(),
+    model: Schema.string().default(DEFAULTS.model).volatile(),
+    includeAssistant: Schema.boolean().default(DEFAULTS.includeAssistant).volatile(),
+    refreshOnTurnEnd: Schema.boolean().default(DEFAULTS.refreshOnTurnEnd).volatile(),
+    refreshMinIntervalMs: Schema.number().step(1000).min(0).max(3600000).default(DEFAULTS.refreshMinIntervalMs).volatile(),
+    refreshMaxTurns: Schema.number().step(1).min(0).max(100000).default(DEFAULTS.refreshMaxTurns).volatile(),
+    excludeForks: Schema.boolean().default(DEFAULTS.excludeForks).volatile(),
+    excludeIdPrefixes: Schema.string().default(DEFAULTS.excludeIdPrefixes).volatile(),
+    backfillOnStart: Schema.boolean().default(DEFAULTS.backfillOnStart).volatile(),
+    backfillMaxSessions: Schema.number().step(1).min(1).max(200).default(DEFAULTS.backfillMaxSessions).volatile(),
+    backfillIntervalMs: Schema.number().step(1).min(0).max(60000).default(DEFAULTS.backfillIntervalMs).volatile()
   })
 }
+
+// 0.1.7 loader 通过 entry.fiber.runtime.Config 自动发现 schema，必须在模块顶层
+// 同步构建导出。schemastery 的 CJS 副本可直接 require（与宿主 settings 服务同源）；
+// ESM 副本留给原异步路径（apply 内降级用）。
+function loadSchemasterySync() {
+  const { createRequire } = require('node:module')
+  for (const target of hostCandidatePaths('schemastery', 'lib/index.cjs')) {
+    try { return createRequire(target)(target) } catch {}
+  }
+  try { return require('@deepseek-ai/schemastery') } catch {}
+  return null
+}
+// schemastery <3.18.4 没有 .volatile()（独立安装场景）：降级为无 Config，
+// 设置写回不可用，但模块加载与插件运行不受影响。
+let Config = null
+try { Config = settingsSchema(loadSchemasterySync()) } catch {}
 
 /** 校验路由覆盖：成对出现才有意义；空串视为未提供。 */
 function resolveRouteOverride(provider, model) {
@@ -486,23 +504,49 @@ async function applyAsync(ctx, config = {}) {
     warn(`无法加载 @deepseek-ai/dsh-llm（宿主安装解析失败），LLM 标题调用不可用，插件保持惰性。解析详情: ${loadErrors.join(' | ') || '无记录'}`)
   }
 
-  // ── 设置命名空间（schemastery；zod 不兼容）。loader config 作为 base，
-  //    settings.yaml 的 dsh-smart-title: 节与设置 UI 可覆盖，2s 内热生效。──
-  let settingsScope = null
-  const Schema = await resolveSchema()
-  const schema = settingsSchema(Schema)
-  if (schema && ctx.settings && typeof ctx.settings.register === 'function') {
+  // ── 0.1.7 settings 接线（对齐 dsh-settings-ui / hermes-loop）──
+  // settings 服务不再支持 ctx.settings.register：Config 已在模块顶层导出
+  // （volatile 字段），读走 describe() 投影，写走 ctx.settings.update()
+  // （持久化进 profile patch，重启不丢）。服务缺席/写回失败时退回
+  // memoryPatch 进程内兜底（仅本次运行有效）。
+  const base = { ...DEFAULTS, ...(config || {}) }
+  let liveSettings = {} // settings 文档实时值（document-updated 事件驱动刷新）
+  const memoryPatch = {} // 进程内兜底
+  function readDescriptor() {
     try {
-      settingsScope = ctx.settings.register(SETTINGS_NS, schema, { base: { ...DEFAULTS, ...config } })
-      trace('settings-registered', {})
-    } catch (e) {
-      warn(`settings register 失败（仅 loader config 生效）: ${(e && e.message) || e}`)
+      if (!ctx.settings || typeof ctx.settings.describe !== 'function') return null
+      return ctx.settings.describe().find((x) => x.ns === SETTINGS_NS) || null
+    } catch { return null }
+  }
+  // apply 时 loader 可能尚未就绪（describe 投影里还没有本插件条目），间隔重试
+  let liveSeen = false
+  function refreshLive(attempt = 0) {
+    const d = readDescriptor()
+    if (d) {
+      if (!liveSeen) trace('settings-live-ready', {})
+      liveSeen = true
+      if (d.value && typeof d.value === 'object') liveSettings = d.value
+      return
     }
+    if (attempt < 15) setTimeout(() => { refreshLive(attempt + 1) }, 2000).unref?.()
   }
-  const effective = () => {
-    const fromSettings = settingsScope && typeof settingsScope.get === 'function' ? settingsScope.get() : null
-    return { ...DEFAULTS, ...config, ...fromSettings }
-  }
+  refreshLive()
+
+  const effective = () => ({ ...base, ...liveSettings, ...memoryPatch })
+
+  // settings 文档变更（dsh 自动生成的设置页、本插件面板写回）刷新实时值
+  try {
+    if (ctx.on && typeof ctx.on === 'function') {
+      ctx.effect(() => {
+        const off = ctx.on('settings/document-updated', (ns) => {
+          if (ns !== SETTINGS_NS) return
+          const d = readDescriptor()
+          if (d && d.value && typeof d.value === 'object') liveSettings = d.value
+        })
+        return () => { try { off() } catch {} }
+      }, 'dsh-smart-title: settings watch')
+    }
+  } catch { /* 事件订阅不可用：写回后靠 memoryPatch 维持本次运行 */ }
 
   trace('armed', { pid: process.pid, llmAvailable: Boolean(dshLlm) })
 
@@ -732,12 +776,15 @@ async function applyAsync(ctx, config = {}) {
           }
 
           // PUT /dsh-smart-title/api/settings — 白名单清洗后落 settings 服务
-          //（settings 服务缺席时退回内存覆盖，仅本次进程有效）
+          //（0.1.7 持久化进 profile patch；写回失败退回 memoryPatch，仅本次进程有效）
           if (req.method === 'PUT' && apiPath.endsWith(`/${PLUGIN_ID}/api/settings`)) {
             const body = await readJsonBody(req)
             const patch = sanitizePatch(body)
-            if (settingsScope && typeof settingsScope.update === 'function') await settingsScope.update(patch)
-            else Object.assign(config, patch)
+            Object.assign(memoryPatch, patch)
+            if (ctx.settings && typeof ctx.settings.update === 'function') {
+              try { await ctx.settings.update(SETTINGS_NS, patch) }
+              catch (e) { warn(`settings update 失败（仅本次运行生效）: ${(e && e.message) || e}`) }
+            }
             trace('settings-updated', { keys: Object.keys(patch) })
             sendJson(res, 200, { settings: safeSettings(effective()) })
             return
@@ -787,6 +834,7 @@ async function applyAsync(ctx, config = {}) {
 module.exports = {
   name: PLUGIN_ID,
   inject: ['sessionTitle', 'llm', 'sessions', 'settings', 'webServer', 'agentDefaultModel', 'connection'],
+  Config,
   __internals: {
     reasonKind,
     isExcluded,

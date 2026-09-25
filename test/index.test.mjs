@@ -265,7 +265,7 @@ test('apply: 注册提供方（automatic=first-prompt）并订阅 session/event'
   assert.equal(registered[0].id, 'dsh-smart-title')
   assert.equal(registered[0].automatic, 'first-prompt')
   assert.equal(typeof registered[0].generate, 'function')
-  assert.equal(effects.length, 2)
+  assert.equal(effects.length, 3) // provider 会话订阅 + api 路由 + settings watch
   assert.equal(typeof getHandler(), 'function')
 })
 
