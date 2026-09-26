@@ -5,7 +5,7 @@
 
 **会话智能标题插件**：用 LLM 自动改写会话标题，告别「第一行」式标题。
 
-![demo](https://raw.githubusercontent.com/weibaohui/dsh-smart-title/main/docs/demo.gif)
+![demo](https://cdn.jsdelivr.net/gh/weibaohui/dsh-smart-title@main/docs/demo.gif)
 
 ## 核心功能
 
