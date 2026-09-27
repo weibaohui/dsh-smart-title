@@ -179,9 +179,11 @@ function loadSchemasterySync() {
   return null
 }
 // schemastery <3.18.4 没有 .volatile()（独立安装场景）：降级为无 Config，
-// 设置写回不可用，但模块加载与插件运行不受影响。
-let Config = null
-try { Config = settingsSchema(loadSchemasterySync()) } catch {}
+// 设置写回不可用，但模块加载与插件运行不受影响。降级值必须是 undefined 而非
+// null：宿主 settings 的 schema() 只排除 undefined，"toJSON" in null 会抛
+// TypeError 逃出 describe()，拖垮整份设置文档（同 dsh-continue#4）。
+let Config
+try { Config = settingsSchema(loadSchemasterySync()) || undefined } catch {}
 
 /** 校验路由覆盖：成对出现才有意义；空串视为未提供。 */
 function resolveRouteOverride(provider, model) {
@@ -849,7 +851,7 @@ async function applyAsync(ctx, config = {}) {
 module.exports = {
   name: PLUGIN_ID,
   inject: ['sessionTitle', 'llm', 'sessions', 'settings', 'webServer', 'agentDefaultModel', 'connection'],
-  Config,
+  Config: Config ?? undefined,
   __internals: {
     reasonKind,
     isExcluded,
